@@ -1,1 +1,135 @@
 # Fork-Join-ThreadPool
+
+## General Design:
+
+    ### Structures.
+
+        Our design makes use of three structs: thread_pool, future, and worker.
+
+        #### Threadpool:
+
+            Thread_pool is essentially just a collection of workers (struct workers) that holds
+            all the global variables these workers need to synchronize with each other. These global variables
+            are: workers, global_queue, lock, cond, barrier, shutdown.
+
+            - workers is the list containing all the worker threads.
+
+            - global queue is the list of all tasks that are submitted externally.
+
+            - lock is the global lock used to protect all the "global" variables.
+            
+            - cond is the condition variable that is used to wake up all the threads during shutdown.
+            
+            - barrier is used to sync up the start of each of the workers' execution of the thread_function.
+            
+            - shutdown is a boolean value for when the shutdown_and_destroy function is called.
+        
+        #### Future:
+
+            Future essentially functions as a task-wrapper, it holds a function pointer, "task" 
+            which is of type fork_join_task_t, which points to the function to run, and a couple other
+            variables used alongside "task"; these other variables are:
+
+            - data: the data it needs to pass to the function.
+            - result,: the result of the computation that will be figured out once 
+                    the task is done running.
+            - status: which indicates which stage the task is currently in. 
+                    0, if it hasn't started yet.
+                    1, if it is in progress.
+                    2, if it has completed its computation.
+            - task_is_done: which is a pthread_cond_t value used to signal to future_get
+                    whether the task has been completed.
+            - pool: which is used to access the pool, and through the pool, the workers 
+                    to assign this task to.
+
+        #### Worker: 
+
+            The worker struct can be viewed as a thread-wrapper. It holds the local queue that
+            each thread pulls tasks out of. And it contains a list_elem to allow the thread_pool 
+            to use list.c to traverse through a list of workers. Aside from that the worker struct 
+            holds thread_id, a pthread_t that refers to the thread this specific worker is meant to
+            hold values for.
+
+    ### Functions:
+
+        #### thread_pool_new
+
+            method signature: struct thread_pool * thread_pool_new(int nthreads);
+
+            thread_pool_new is used to initialize the worker threads, all related
+            variables, and call pthread_create 'nthereads' times to create the appropriate 
+            amount of threads. 
+
+        #### thread_pool_shutdown_and_destroy
+
+            method signature: void thread_pool_shutdown_and_destroy(struct thread_pool * pool);
+
+            thread_pool_shutdown_and_destroy() toggles on the shutdown flag, and waits for all
+            the threads to shutdown, using pthread_join. Then it proceeds to empty out and free
+            all the workers in the worker list.
+        
+        #### thread_pool_submit
+
+            method signature: struct future * thread_pool_submit(struct thread_pool *pool, 
+                                            fork_join_task_t task, void * data)
+
+            thread_pool_submit is used to submit tasks to the threadpool. task and data is used to
+            initialize a new future that is added to the pool's global queue if the task was an external submission
+            and to the current_worker's local queue if the task was an internal submission.
+
+        #### future_get:
+
+            method signature: void * future_get(struct future * f)
+
+            future_get is used by external caller's to get the result of a computation.
+            if the task associated with the computation hasn't been started yet, future_gets runs the
+            computation right then and there, otherwise it waits until the future is done executing.
+
+        #### future_free:
+
+            method signature: void future_free(struct future * f)
+
+            future_free is used to free all the space associated with the
+            future 'f' and destroy it's task_is_done condition variable.
+
+        #### thread_function:
+
+            method signature: static void * thread_function(void * param)
+
+            thread_function is the function run by all the threads created by the pool.
+            It starts out by using the param void pointer to get the current_worker, and through
+            the current_worker, the thread_pool this thread is part of. It then waits for all the other
+            threads to be created through the pthread_barrier_wait(&pool->barrier) call.
+
+            It then proceeds to run a while(true) loop that only only stops when either the shutdown process
+            has been started or there is an error. Inside the loop, after engaging the lock, the threads checks 
+            whether the pool is inactive with a call to is_pool_inactive and if it is, the code repeatedly calls
+            pthread_cond_wait() until a signal is sent to pool->cond. If the pool is active, the thread gets a task
+            to run; this is done by first trying to get a future from the current_worker's local_queue, if that
+            fails, the thread tries to get a task from the global queue, and if thats not possible either, we steal a task
+            not yet started from another worker's queue. We then unlock the lock, run the task, lock the lock again, and then 
+            proceed to loop again from the beginning. 
+
+            Once the while(true) loop is broken, we call pthread_exit(NULL) and return 0.
+
+        #### is_pool_inactive
+
+            method signature: static bool is_pool_inactive(struct thread_pool * pool)
+
+            is_pool_inactive() looks through all the worker's local queues and the pool's global queue, to see whether any tasks
+            are left. If any tasks are left, or the shutdown flag is on, is_pool_inactive returns false, otherwise 
+            it returns true. 
+
+        #### steal_task
+
+            method signature: static struct list_elem * steal_task(struct thread_pool * pool)
+
+            steal_task is used to steal a task from another worker. It loops through
+            all the workers under 'pool''s worker list, and steals the first available task for the caller worker.
+    
+
+## Optimizing Performance:
+
+    Our implmentation uses a simple single-lock implmentation, which although does not pass the fibonacci tests
+    in the required time, it does pass all other tests in a pretty fast time. Most of our optimization came from implementing the 
+    work stealing approach as mentioned in the project handout. 
